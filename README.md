@@ -36,6 +36,10 @@ Not implemented yet:
 
 See `PLAN.md` for the full migration plan.
 
+The dynamic hidden-state update problem after top-p selection is discussed in
+`PLAN.md` under `Sparse Hidden-State Update Designs`. It compares a block-level
+compact operator with an exact token-level prefix-sum compact operator.
+
 ## Directory Layout
 
 ```text

@@ -107,6 +107,174 @@ The host wrapper converts `new_seq_lens` to `new_cu_seqlens` and
 5. Replace scalar GM access with UB staging or SIMT direct loops.
 6. Add zero-score and boundary tests after first successful device run.
 
+## Sparse Hidden-State Update Designs
+
+The current UniPrefill Python path uses dynamic indexing after top-p selection:
+
+```python
+kept_indices = token_mask.nonzero(as_tuple=True)[0]
+n_kept = kept_indices.shape[0]
+hidden_states[:n_kept] = hidden_states[kept_indices]
+residual[:n_kept] = residual[kept_indices]
+positions[:n_kept] = positions[kept_indices]
+```
+
+This is unfriendly to NPU execution because `nonzero`, dynamic index gather,
+and host-visible dynamic lengths can introduce synchronization. The AscendC
+port should avoid exposing variable-length indices to Python.
+
+### Option A: Block-Level Compact Operator
+
+Compact at block granularity and keep output buffers with fixed capacity.
+
+```text
+hidden_states[total_tokens, hidden_dim]
+residual[total_tokens, hidden_dim]
+positions[total_tokens]
+block_mask[total_blocks]
+cu_seqlens[batch + 1]
+cu_block_seqlens[batch + 1]
+  -> compact_hidden[total_tokens, hidden_dim]
+  -> compact_residual[total_tokens, hidden_dim]
+  -> compact_positions[total_tokens]
+  -> new_cu_seqlens[batch + 1]
+  -> new_max_seq_len
+```
+
+Semantics:
+
+1. Treat `block_mask` as the primary selection result.
+2. Force keep prefix and suffix by block, not by individual token:
+   - `sink_blocks = ceil(attention_sink / block_size)`
+   - `tail_blocks = ceil(last_q / block_size)`
+3. For each request, copy selected blocks into a compact contiguous region.
+4. Write `new_seq_lens[req]` as the kept token count after block expansion.
+5. Keep tensor capacity static; downstream metadata determines valid tokens.
+
+Recommended API:
+
+```python
+compact_hidden, compact_residual, compact_positions, new_cu_seqlens, new_max_seq_len = (
+    torch.ops.npu.uniprefill_block_compact(
+        hidden_states,
+        residual,
+        positions,
+        block_mask,
+        cu_seqlens,
+        cu_block_seqlens,
+        block_size,
+        attention_sink,
+        last_q,
+    )
+)
+```
+
+Pros:
+
+- Avoids token-level `nonzero`.
+- Produces regular block copies that are easier to implement and optimize in
+  AscendC.
+- Matches the current top-p selection granularity.
+- More likely to avoid host-device synchronization in vLLM integration.
+
+Cons:
+
+- Keeps extra tokens when forced sink/tail boundaries are not block-aligned.
+- May lose some sparsity compared with exact token-level compaction.
+- Requires downstream code to consume fixed-capacity compact buffers using
+  device-side sequence metadata.
+
+Implementation plan:
+
+1. Add `uniprefill_block_compact` to `op_extension/register.cpp`.
+2. Add tiling data for `batch`, `maxSeqLen`, `hiddenDim`, `blockSize`, and
+   maximum blocks per request.
+3. Kernel 1 computes per-request kept block counts and `new_seq_lens`.
+4. Host wrapper or a later scan kernel builds `new_cu_seqlens`.
+5. Kernel 2 copies selected blocks of hidden/residual/positions into compact
+   output.
+6. Validate against a PyTorch block-compaction golden reference.
+
+This should be the first implementation target because it removes the largest
+NPU synchronization hazard with the least semantic complexity.
+
+### Option B: Token-Level Prefix-Sum Compact Operator
+
+Keep exact token-level semantics but move all dynamic indexing into AscendC.
+
+```text
+hidden_states[total_tokens, hidden_dim]
+residual[total_tokens, hidden_dim]
+positions[total_tokens]
+token_mask[total_tokens]
+cu_seqlens[batch + 1]
+  -> compact_hidden[total_tokens, hidden_dim]
+  -> compact_residual[total_tokens, hidden_dim]
+  -> compact_positions[total_tokens]
+  -> new_cu_seqlens[batch + 1]
+  -> new_max_seq_len
+```
+
+Semantics:
+
+1. Convert `token_mask` to per-token keep flags.
+2. Compute a per-request prefix sum over keep flags.
+3. For each kept token, scatter it to:
+
+   ```text
+   output_offset = new_cu_seqlens[req] + prefix_keep_count[token] - 1
+   ```
+
+4. Keep output buffers fixed-capacity and expose valid lengths through
+   `new_cu_seqlens`.
+
+Recommended API:
+
+```python
+compact_hidden, compact_residual, compact_positions, new_cu_seqlens, new_max_seq_len = (
+    torch.ops.npu.uniprefill_token_compact(
+        hidden_states,
+        residual,
+        positions,
+        token_mask,
+        cu_seqlens,
+    )
+)
+```
+
+Pros:
+
+- Preserves exact current Python semantics.
+- Maximizes sparsity and avoids block-boundary over-retention.
+- Can be reused if future selection becomes token-level instead of block-level.
+
+Cons:
+
+- Requires a parallel prefix-sum implementation.
+- More difficult to optimize for long variable-length requests.
+- Needs careful handling of cross-request offsets and large hidden dimensions.
+- More likely to need multiple kernels or a temporary prefix buffer.
+
+Implementation plan:
+
+1. Add a PyTorch golden reference for exact token compaction.
+2. Implement per-request keep-count kernel.
+3. Build `new_cu_seqlens` on host for MVP, then replace with device scan if
+   host synchronization becomes measurable.
+4. Implement token scatter-copy kernel using prefix offsets.
+5. Extend the copy path to hidden/residual/positions together to avoid repeated
+   memory passes.
+6. Benchmark against Option A using the same `block_mask`/`token_mask` inputs.
+
+This option should be kept as the accuracy-preserving fallback, but it is not
+the best first target for NPU performance.
+
+### Decision
+
+Start with Option A. UniPrefill already selects blocks, so block-level compact
+keeps the execution regular and avoids dynamic token indices. Implement Option B
+only if block over-retention causes unacceptable quality or speed loss.
+
 ## Accuracy Tests
 
 Required cases:
