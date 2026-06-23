@@ -269,6 +269,29 @@ Implementation plan:
 This option should be kept as the accuracy-preserving fallback, but it is not
 the best first target for NPU performance.
 
+### Fixed-Ratio Top-K Selection Reference
+
+For NPU serving, top-p can be replaced by fixed-ratio block top-k to make the
+kept-token budget predictable. The current reference implementation is:
+
+```text
+scripts/top_k_selection.py
+```
+
+Default policy:
+
+```text
+keep all sink blocks
+keep all tail blocks
+keep top ceil(middle_blocks * 0.05) middle blocks
+keep at least 2 middle blocks when a middle region exists
+```
+
+This ratio is applied only to the prunable middle region, not to forced
+attention-sink or tail blocks. The script exposes both a block-score-only helper
+for the current AscendC project scope and a q/k-to-mask reference mirroring the
+GPU top-p path.
+
 ### Decision
 
 Start with Option A. UniPrefill already selects blocks, so block-level compact
