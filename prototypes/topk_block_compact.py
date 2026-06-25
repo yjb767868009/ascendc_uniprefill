@@ -1,11 +1,26 @@
-"""Python reference for fixed-budget block top-k compact.
+"""Python reference for fixed 5% bottom-k middle-block drop with real compact.
 
-This prototype demonstrates the no-host-sync idea for token dropping:
-output shapes are determined by CPU-side budget metadata, not by
-``token_mask.sum()`` produced on device.
+Answer to the earlier question first:
+this version does not use "top-p + padding budget" any more. Instead, for each
+request we:
 
-The future AscendC op should implement the same data movement pattern:
-  block_scores + fixed keep_blocks_per_req -> selected blocks -> compact tokens
+1. force-keep sink blocks,
+2. force-keep tail blocks,
+3. drop a fixed ratio of the remaining middle blocks,
+4. compact the surviving tokens into a real dense output with no padding.
+
+The key point is that the output shape is still host-known before launch:
+- sink/tail token counts are known from seq_len/block_size/attention_sink/last_q
+- dropped middle block count is a fixed host policy
+- every middle block has length exactly block_size
+
+So we avoid dynamic ``token_mask.sum()`` while also avoiding fake padding tokens
+entering FA / proposer / slot_mapping.
+
+Answer to the latest question:
+the right policy is fixed 5% drop on middle blocks only. Sink/tail blocks are
+always kept, and the host precomputes the exact real output length from the
+number of kept complete blocks plus the exact sink/tail token lengths.
 
 Run:
   python3 /autodl-fs/data/yjb/ascendc_uniprefill/prototypes/topk_block_compact.py
@@ -19,27 +34,34 @@ import torch
 
 
 @dataclass(frozen=True)
-class TopKCompactBudget:
-    """Host-known shape metadata for fixed-budget compact."""
+class RealCompactPlan:
+    """Host-known compact plan.
 
-    keep_blocks_per_req: torch.Tensor  # int32 CPU, [batch]
-    budget_lens: torch.Tensor  # int32 CPU, [batch]
-    budget_cu_seqlens: torch.Tensor  # int32 CPU, [batch + 1]
-    max_budget_len: int
+    All fields are computable on CPU from sequence metadata and the fixed drop
+    policy. Future AscendC kernels should consume the same metadata.
+    """
+
+    drop_middle_blocks_per_req: torch.Tensor  # int32 CPU, [batch]
+    keep_middle_blocks_per_req: torch.Tensor  # int32 CPU, [batch]
+    sink_token_lens: torch.Tensor  # int32 CPU, [batch]
+    middle_token_lens: torch.Tensor  # int32 CPU, [batch]
+    tail_token_lens: torch.Tensor  # int32 CPU, [batch]
+    real_lens: torch.Tensor  # int32 CPU, [batch]
+    real_cu_seqlens: torch.Tensor  # int32 CPU, [batch + 1]
+    max_real_len: int
 
 
 @dataclass(frozen=True)
-class TopKCompactResult:
+class RealCompactResult:
     hidden_out: torch.Tensor
     residual_out: torch.Tensor
     positions_out: torch.Tensor
-    budget_cu_seqlens: torch.Tensor
-    selected_block_mask: torch.Tensor
-    valid_token_mask: torch.Tensor
+    slot_mapping_out: torch.Tensor
+    real_cu_seqlens: torch.Tensor
+    kept_block_mask: torch.Tensor
 
 
 def get_cu_block_seqlens(cu_seqlens: torch.Tensor, block_size: int) -> torch.Tensor:
-    """Compute cumulative block lengths from cumulative token lengths."""
     cu_cpu = cu_seqlens.detach().cpu().to(torch.int32)
     seq_lens = cu_cpu[1:] - cu_cpu[:-1]
     block_lens = torch.div(seq_lens + block_size - 1, block_size, rounding_mode="floor")
@@ -48,130 +70,176 @@ def get_cu_block_seqlens(cu_seqlens: torch.Tensor, block_size: int) -> torch.Ten
     return cu_blocks
 
 
-def forced_block_mask_for_request(
+def classify_blocks(
     seq_len: int,
-    num_blocks: int,
     block_size: int,
     attention_sink: int,
     last_q: int,
-) -> torch.Tensor:
-    """Return bool mask over blocks that must be kept for sink/tail tokens."""
-    forced = torch.zeros(num_blocks, dtype=torch.bool)
-    if seq_len <= 0 or num_blocks <= 0:
-        return forced
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return sink, middle, tail block masks for one request.
+
+    The three masks are disjoint and cover all blocks.
+    """
+    num_blocks = (seq_len + block_size - 1) // block_size
+    sink = torch.zeros(num_blocks, dtype=torch.bool)
+    tail = torch.zeros(num_blocks, dtype=torch.bool)
+    middle = torch.zeros(num_blocks, dtype=torch.bool)
+
+    if num_blocks == 0:
+        return sink, middle, tail
 
     sink_tokens = min(max(attention_sink, 0), seq_len)
-    sink_blocks = (sink_tokens + block_size - 1) // block_size
-    if sink_blocks > 0:
-        forced[:sink_blocks] = True
+    if sink_tokens > 0:
+        sink_blocks = (sink_tokens + block_size - 1) // block_size
+        sink[:sink_blocks] = True
 
     tail_tokens = min(max(last_q, 0), seq_len)
     if tail_tokens > 0:
         tail_start = max(seq_len - tail_tokens, 0)
         tail_block_start = tail_start // block_size
-        forced[tail_block_start:] = True
+        tail[tail_block_start:] = True
 
-    return forced
+    middle = ~(sink | tail)
+    return sink, middle, tail
 
 
-def compute_fixed_budget(
+def block_real_token_length(
+    block_idx: int,
+    seq_len: int,
+    block_size: int,
+) -> int:
+    start = block_idx * block_size
+    end = min(start + block_size, seq_len)
+    return max(end - start, 0)
+
+
+def count_mask_real_tokens(mask: torch.Tensor, seq_len: int, block_size: int) -> int:
+    total = 0
+    for block_idx, keep in enumerate(mask.tolist()):
+        if keep:
+            total += block_real_token_length(block_idx, seq_len, block_size)
+    return total
+
+
+def compute_real_compact_plan(
     cu_seqlens: torch.Tensor,
     block_size: int,
-    keep_ratio: float,
+    drop_ratio: float,
     attention_sink: int,
     last_q: int,
-) -> TopKCompactBudget:
-    """Compute all output shapes on CPU before any device selection runs.
+) -> RealCompactPlan:
+    """Compute exact real output lengths on CPU.
 
-    This is the no-sync contract: future kernels must write into exactly this
-    preallocated capacity. The budget is based only on host-known metadata.
+    Policy:
+    - sink blocks are always kept
+    - tail blocks are always kept
+    - among middle blocks, drop floor(num_middle_blocks * drop_ratio)
+    - surviving middle blocks are complete blocks, so each contributes block_size
     """
     if block_size <= 0:
         raise ValueError("block_size must be positive")
-    if not (0.0 < keep_ratio <= 1.0):
-        raise ValueError("keep_ratio must be in (0, 1]")
+    if not (0.0 <= drop_ratio < 1.0):
+        raise ValueError("drop_ratio must be in [0, 1)")
 
     cu_cpu = cu_seqlens.detach().cpu().to(torch.int32)
     seq_lens = cu_cpu[1:] - cu_cpu[:-1]
     batch = int(seq_lens.numel())
 
-    keep_blocks = torch.zeros(batch, dtype=torch.int32)
-    budget_lens = torch.zeros(batch, dtype=torch.int32)
+    drop_middle = torch.zeros(batch, dtype=torch.int32)
+    keep_middle = torch.zeros(batch, dtype=torch.int32)
+    sink_lens = torch.zeros(batch, dtype=torch.int32)
+    middle_lens = torch.zeros(batch, dtype=torch.int32)
+    tail_lens = torch.zeros(batch, dtype=torch.int32)
+    real_lens = torch.zeros(batch, dtype=torch.int32)
 
     for req, seq_len_t in enumerate(seq_lens.tolist()):
         seq_len = int(seq_len_t)
-        num_blocks = (seq_len + block_size - 1) // block_size
-        ratio_blocks = int(torch.ceil(torch.tensor(num_blocks * keep_ratio)).item())
-        forced = forced_block_mask_for_request(
-            seq_len, num_blocks, block_size, attention_sink, last_q
-        )
-        forced_blocks = int(forced.sum().item())
-        k = max(ratio_blocks, forced_blocks)
-        k = min(k, num_blocks)
-        keep_blocks[req] = k
-        # Fixed budget uses full block capacity. Tail/padding tokens may exist.
-        budget_lens[req] = k * block_size
+        sink, middle, tail = classify_blocks(seq_len, block_size, attention_sink, last_q)
+        num_middle = int(middle.sum().item())
+        drop_k = int(num_middle * drop_ratio)  # floor by Python int conversion
+        keep_k = num_middle - drop_k
 
-    budget_cu = torch.zeros(batch + 1, dtype=torch.int32)
+        sink_len = count_mask_real_tokens(sink, seq_len, block_size)
+        tail_len = count_mask_real_tokens(tail, seq_len, block_size)
+        middle_len = keep_k * block_size
+
+        drop_middle[req] = drop_k
+        keep_middle[req] = keep_k
+        sink_lens[req] = sink_len
+        middle_lens[req] = middle_len
+        tail_lens[req] = tail_len
+        real_lens[req] = sink_len + middle_len + tail_len
+
+    real_cu = torch.zeros(batch + 1, dtype=torch.int32)
     if batch:
-        budget_cu[1:] = torch.cumsum(budget_lens, dim=0)
-    max_budget_len = int(budget_lens.max().item()) if batch else 0
-    return TopKCompactBudget(keep_blocks, budget_lens, budget_cu, max_budget_len)
+        real_cu[1:] = torch.cumsum(real_lens, dim=0)
+
+    max_real_len = int(real_lens.max().item()) if batch else 0
+    return RealCompactPlan(
+        drop_middle_blocks_per_req=drop_middle,
+        keep_middle_blocks_per_req=keep_middle,
+        sink_token_lens=sink_lens,
+        middle_token_lens=middle_lens,
+        tail_token_lens=tail_lens,
+        real_lens=real_lens,
+        real_cu_seqlens=real_cu,
+        max_real_len=max_real_len,
+    )
 
 
-def select_topk_blocks_for_request(
+def select_kept_blocks_for_request(
     scores: torch.Tensor,
     seq_len: int,
     block_size: int,
-    keep_blocks: int,
+    keep_middle_blocks: int,
     attention_sink: int,
     last_q: int,
 ) -> torch.Tensor:
-    """Select exactly keep_blocks blocks, with forced sink/tail blocks included."""
-    num_blocks = int(scores.numel())
-    selected = forced_block_mask_for_request(
-        seq_len, num_blocks, block_size, attention_sink, last_q
-    ).to(scores.device)
+    """Keep sink+tail blocks and top-k middle blocks by score."""
+    sink, middle, tail = classify_blocks(seq_len, block_size, attention_sink, last_q)
+    kept = sink | tail
 
-    keep_blocks = min(max(int(keep_blocks), int(selected.sum().item())), num_blocks)
-    remaining_k = keep_blocks - int(selected.sum().item())
-    if remaining_k <= 0:
-        return selected
+    middle_indices = torch.nonzero(middle, as_tuple=False).flatten()
+    if middle_indices.numel() == 0 or keep_middle_blocks <= 0:
+        return kept.to(scores.device)
 
-    candidate_scores = scores.float().clone()
-    candidate_scores[selected] = -torch.inf
-    topk = torch.topk(candidate_scores, k=remaining_k, largest=True, sorted=False).indices
-    selected[topk] = True
-    return selected
+    keep_middle_blocks = min(int(keep_middle_blocks), int(middle_indices.numel()))
+    middle_scores = scores[middle_indices].float()
+    topk_local = torch.topk(middle_scores, k=keep_middle_blocks, largest=True, sorted=False).indices
+    kept[middle_indices[topk_local]] = True
+    return kept.to(scores.device)
 
 
 def topk_block_compact_reference(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
     block_scores: torch.Tensor,
     cu_seqlens: torch.Tensor,
     cu_block_seqlens: torch.Tensor,
-    budget: TopKCompactBudget,
+    plan: RealCompactPlan,
     block_size: int,
     attention_sink: int,
     last_q: int,
-) -> TopKCompactResult:
-    """Compact selected top-k blocks into fixed-shape outputs.
+) -> RealCompactResult:
+    """Compact kept blocks into a real dense output with no padding tokens.
 
     Shapes:
       hidden_states: [T, H]
       residual:      [T, H]
       positions:     [T]
+      slot_mapping:  [T]
       block_scores:  [total_blocks]
 
     Outputs:
-      hidden_out:    [budget_cu_seqlens[-1], H]
-      residual_out:  [budget_cu_seqlens[-1], H]
-      positions_out: [budget_cu_seqlens[-1]]
+      hidden_out:       [real_cu_seqlens[-1], H]
+      residual_out:     [real_cu_seqlens[-1], H]
+      positions_out:    [real_cu_seqlens[-1]]
+      slot_mapping_out: [real_cu_seqlens[-1]]
 
-    The output first dimension is host-known from ``budget``. It never depends on
-    device-computed ``token_mask.sum()``.
+    The first dimension is host-known from ``plan``. No device-side token count
+    is needed to allocate it.
     """
     if hidden_states.ndim != 2:
         raise ValueError("hidden_states must be [T, H]")
@@ -179,19 +247,21 @@ def topk_block_compact_reference(
         raise ValueError("residual must have the same shape as hidden_states")
     if positions.ndim != 1 or positions.shape[0] != hidden_states.shape[0]:
         raise ValueError("positions must be [T]")
+    if slot_mapping.ndim != 1 or slot_mapping.shape[0] != hidden_states.shape[0]:
+        raise ValueError("slot_mapping must be [T]")
 
     device = hidden_states.device
     cu_seq = cu_seqlens.detach().cpu().to(torch.int32)
     cu_blk = cu_block_seqlens.detach().cpu().to(torch.int32)
     batch = int(cu_seq.numel() - 1)
-    total_budget = int(budget.budget_cu_seqlens[-1].item())
+    total_real = int(plan.real_cu_seqlens[-1].item())
     hidden_size = hidden_states.shape[1]
 
-    hidden_out = torch.empty((total_budget, hidden_size), dtype=hidden_states.dtype, device=device)
-    residual_out = torch.empty((total_budget, hidden_size), dtype=residual.dtype, device=device)
-    positions_out = torch.empty((total_budget,), dtype=positions.dtype, device=device)
-    valid_token_mask = torch.zeros((total_budget,), dtype=torch.bool, device=device)
-    selected_block_mask = torch.zeros_like(block_scores, dtype=torch.bool, device=device)
+    hidden_out = torch.empty((total_real, hidden_size), dtype=hidden_states.dtype, device=device)
+    residual_out = torch.empty((total_real, hidden_size), dtype=residual.dtype, device=device)
+    positions_out = torch.empty((total_real,), dtype=positions.dtype, device=device)
+    slot_mapping_out = torch.empty((total_real,), dtype=slot_mapping.dtype, device=device)
+    kept_block_mask = torch.zeros_like(block_scores, dtype=torch.bool, device=device)
 
     for req in range(batch):
         src_token_start = int(cu_seq[req].item())
@@ -199,18 +269,19 @@ def topk_block_compact_reference(
         seq_len = src_token_end - src_token_start
         src_block_start = int(cu_blk[req].item())
         src_block_end = int(cu_blk[req + 1].item())
-        dst_start = int(budget.budget_cu_seqlens[req].item())
-        keep_blocks = int(budget.keep_blocks_per_req[req].item())
+        dst_start = int(plan.real_cu_seqlens[req].item())
+        expected_end = int(plan.real_cu_seqlens[req + 1].item())
+        keep_middle = int(plan.keep_middle_blocks_per_req[req].item())
 
         scores = block_scores[src_block_start:src_block_end]
-        selected = select_topk_blocks_for_request(
-            scores, seq_len, block_size, keep_blocks, attention_sink, last_q
+        kept = select_kept_blocks_for_request(
+            scores, seq_len, block_size, keep_middle, attention_sink, last_q
         )
-        selected_block_mask[src_block_start:src_block_end] = selected
+        kept_block_mask[src_block_start:src_block_end] = kept
 
         write = dst_start
-        for block_offset in range(int(selected.numel())):
-            if not bool(selected[block_offset].item()):
+        for block_offset in range(int(kept.numel())):
+            if not bool(kept[block_offset].item()):
                 continue
             src_begin = src_token_start + block_offset * block_size
             src_end = min(src_begin + block_size, src_token_end)
@@ -218,105 +289,126 @@ def topk_block_compact_reference(
             if real_len <= 0:
                 continue
 
-            # Copy real tokens.
             hidden_out[write : write + real_len] = hidden_states[src_begin:src_end]
             residual_out[write : write + real_len] = residual[src_begin:src_end]
             positions_out[write : write + real_len] = positions[src_begin:src_end]
-            valid_token_mask[write : write + real_len] = True
+            slot_mapping_out[write : write + real_len] = slot_mapping[src_begin:src_end]
+            write += real_len
 
-            # Pad tail block to full block_size so the request output length is fixed.
-            pad_len = block_size - real_len
-            if pad_len > 0:
-                pad_start = write + real_len
-                pad_end = write + block_size
-                hidden_out[pad_start:pad_end] = 0
-                residual_out[pad_start:pad_end] = 0
-                positions_out[pad_start:pad_end] = 0
-
-            write += block_size
-
-        expected_end = dst_start + int(budget.budget_lens[req].item())
         if write != expected_end:
             raise RuntimeError(
-                f"request {req} wrote {write - dst_start} tokens, "
-                f"expected budget {expected_end - dst_start}"
+                f"request {req} wrote {write - dst_start} tokens, expected {expected_end - dst_start}"
             )
 
-    return TopKCompactResult(
+    return RealCompactResult(
         hidden_out=hidden_out,
         residual_out=residual_out,
         positions_out=positions_out,
-        budget_cu_seqlens=budget.budget_cu_seqlens.to(device),
-        selected_block_mask=selected_block_mask,
-        valid_token_mask=valid_token_mask,
+        slot_mapping_out=slot_mapping_out,
+        real_cu_seqlens=plan.real_cu_seqlens.to(device),
+        kept_block_mask=kept_block_mask,
     )
+
+
+def _indices_from_mask(mask: torch.Tensor, value: bool) -> list[int]:
+    return torch.nonzero(mask.cpu() == value, as_tuple=False).flatten().tolist()
+
+
+def _head_tail(values: torch.Tensor, n: int = 16) -> tuple[list[int], list[int]]:
+    values_cpu = values.detach().cpu().to(torch.int64)
+    if values_cpu.numel() <= 2 * n:
+        vals = values_cpu.tolist()
+        return vals, []
+    return values_cpu[:n].tolist(), values_cpu[-n:].tolist()
 
 
 def demo() -> None:
     torch.manual_seed(0)
 
     # Example batch:
-    #   req0: 10 tokens -> 3 blocks when block_size=4
-    #   req1: 14 tokens -> 4 blocks when block_size=4
-    seq_lens = torch.tensor([10, 14], dtype=torch.int32)
+    #   req0: 8192 tokens -> 128 blocks when block_size=64
+    #   req1: 8192 tokens -> 128 blocks when block_size=64
+    seq_lens = torch.tensor([8192, 8192], dtype=torch.int32)
     cu_seqlens = torch.zeros(3, dtype=torch.int32)
     cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0)
-    block_size = 4
-    keep_ratio = 0.5
-    attention_sink = 2
-    last_q = 3
+    block_size = 64
+    drop_ratio = 0.05
+    attention_sink = 128
+    last_q = 128
     hidden_size = 3
 
     cu_block_seqlens = get_cu_block_seqlens(cu_seqlens, block_size)
     total_tokens = int(cu_seqlens[-1].item())
     total_blocks = int(cu_block_seqlens[-1].item())
 
-    # Make contents easy to inspect: each row stores token id repeated.
     token_ids = torch.arange(total_tokens, dtype=torch.float32)
     hidden_states = token_ids[:, None].repeat(1, hidden_size)
     residual = hidden_states + 1000
     positions = torch.arange(total_tokens, dtype=torch.int64)
+    slot_mapping = torch.arange(total_tokens, dtype=torch.int32) + 5000
 
-    # Higher score means more important block.
-    block_scores = torch.tensor([0.1, 0.9, 0.2, 0.5, 0.8, 0.3, 0.7], dtype=torch.float32)
+    # Higher score means more important middle block.
+    block_scores = torch.linspace(0.1, 1.0, steps=total_blocks, dtype=torch.float32)
     assert block_scores.numel() == total_blocks
 
-    budget = compute_fixed_budget(
-        cu_seqlens, block_size, keep_ratio, attention_sink, last_q
+    plan = compute_real_compact_plan(
+        cu_seqlens, block_size, drop_ratio, attention_sink, last_q
     )
     result = topk_block_compact_reference(
         hidden_states,
         residual,
         positions,
+        slot_mapping,
         block_scores,
         cu_seqlens,
         cu_block_seqlens,
-        budget,
+        plan,
         block_size,
         attention_sink,
         last_q,
     )
 
+    assert plan.drop_middle_blocks_per_req.tolist() == [6, 6]
+    assert plan.real_lens.tolist() == [7808, 7808]
+    assert tuple(result.hidden_out.shape) == (15616, hidden_size)
+    assert int((~result.kept_block_mask).sum().item()) == 12
+
     print("Input shapes:")
     print(f"  hidden_states: {tuple(hidden_states.shape)}")
     print(f"  residual:      {tuple(residual.shape)}")
     print(f"  positions:     {tuple(positions.shape)}")
+    print(f"  slot_mapping:  {tuple(slot_mapping.shape)}")
     print(f"  block_scores:  {tuple(block_scores.shape)}")
-    print("Host-known budget:")
-    print(f"  cu_seqlens:           {cu_seqlens.tolist()}")
-    print(f"  cu_block_seqlens:     {cu_block_seqlens.tolist()}")
-    print(f"  keep_blocks_per_req:  {budget.keep_blocks_per_req.tolist()}")
-    print(f"  budget_lens:          {budget.budget_lens.tolist()}")
-    print(f"  budget_cu_seqlens:    {budget.budget_cu_seqlens.tolist()}")
+    print("Host-known real compact plan:")
+    print(f"  cu_seqlens:                 {cu_seqlens.tolist()}")
+    print(f"  cu_block_seqlens:           {cu_block_seqlens.tolist()}")
+    print(f"  drop_middle_blocks_per_req: {plan.drop_middle_blocks_per_req.tolist()}")
+    print(f"  keep_middle_blocks_per_req: {plan.keep_middle_blocks_per_req.tolist()}")
+    print(f"  sink_token_lens:            {plan.sink_token_lens.tolist()}")
+    print(f"  middle_token_lens:          {plan.middle_token_lens.tolist()}")
+    print(f"  tail_token_lens:            {plan.tail_token_lens.tolist()}")
+    print(f"  real_lens:                  {plan.real_lens.tolist()}")
+    print(f"  real_cu_seqlens:            {plan.real_cu_seqlens.tolist()}")
     print("Output shapes:")
-    print(f"  hidden_out:     {tuple(result.hidden_out.shape)}")
-    print(f"  residual_out:   {tuple(result.residual_out.shape)}")
-    print(f"  positions_out:  {tuple(result.positions_out.shape)}")
+    print(f"  hidden_out:       {tuple(result.hidden_out.shape)}")
+    print(f"  residual_out:     {tuple(result.residual_out.shape)}")
+    print(f"  positions_out:    {tuple(result.positions_out.shape)}")
+    print(f"  slot_mapping_out: {tuple(result.slot_mapping_out.shape)}")
+    dropped_blocks = _indices_from_mask(result.kept_block_mask, False)
+    kept_blocks = _indices_from_mask(result.kept_block_mask, True)
+    token_head, token_tail = _head_tail(result.hidden_out[:, 0])
+    slot_head, slot_tail = _head_tail(result.slot_mapping_out)
+
     print("Selection:")
-    print(f"  selected_blocks: {result.selected_block_mask.tolist()}")
-    print(f"  valid_token_mask:{result.valid_token_mask.tolist()}")
-    print("Compacted token ids, padding shows as 0:")
-    print(result.hidden_out[:, 0].to(torch.int64).tolist())
+    print(f"  kept_block_count:    {len(kept_blocks)}")
+    print(f"  dropped_block_count: {len(dropped_blocks)}")
+    print(f"  dropped_blocks:      {dropped_blocks}")
+    print("Compacted token ids:")
+    print(f"  head: {token_head}")
+    print(f"  tail: {token_tail}")
+    print("Compacted slot ids:")
+    print(f"  head: {slot_head}")
+    print(f"  tail: {slot_tail}")
 
 
 if __name__ == "__main__":
