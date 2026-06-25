@@ -61,13 +61,54 @@ class RealCompactResult:
     kept_block_mask: torch.Tensor
 
 
-def get_cu_block_seqlens(cu_seqlens: torch.Tensor, block_size: int) -> torch.Tensor:
-    cu_cpu = cu_seqlens.detach().cpu().to(torch.int32)
-    seq_lens = cu_cpu[1:] - cu_cpu[:-1]
-    block_lens = torch.div(seq_lens + block_size - 1, block_size, rounding_mode="floor")
-    cu_blocks = torch.zeros_like(cu_cpu)
-    cu_blocks[1:] = torch.cumsum(block_lens, dim=0)
+def _as_cpu_int32_1d(values: torch.Tensor | list[int] | tuple[int, ...], name: str) -> torch.Tensor:
+    """Normalize host metadata without ever copying from an accelerator."""
+    if isinstance(values, torch.Tensor):
+        if values.device.type != "cpu":
+            raise ValueError(
+                f"{name} must be CPU/host metadata. Do not pass an accelerator "
+                "tensor here, because .cpu() would synchronize the stream."
+            )
+        out = values.to(dtype=torch.int32)
+    else:
+        out = torch.tensor(values, dtype=torch.int32)
+
+    if out.ndim != 1:
+        raise ValueError(f"{name} must be a 1D tensor/list")
+    return out.contiguous()
+
+
+def get_cu_seqlens_from_seq_lens(seq_lens: torch.Tensor | list[int] | tuple[int, ...]) -> torch.Tensor:
+    """Build CPU cu_seqlens from CPU request lengths."""
+    seq_lens_cpu = _as_cpu_int32_1d(seq_lens, "seq_lens")
+    cu = torch.zeros(seq_lens_cpu.numel() + 1, dtype=torch.int32)
+    if seq_lens_cpu.numel():
+        cu[1:] = torch.cumsum(seq_lens_cpu, dim=0)
+    return cu
+
+
+def get_cu_block_seqlens_from_seq_lens(
+    seq_lens: torch.Tensor | list[int] | tuple[int, ...],
+    block_size: int,
+) -> torch.Tensor:
+    """Build CPU cumulative block lengths from CPU request lengths."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    seq_lens_cpu = _as_cpu_int32_1d(seq_lens, "seq_lens")
+    block_lens = torch.div(seq_lens_cpu + block_size - 1, block_size, rounding_mode="floor")
+    cu_blocks = torch.zeros(seq_lens_cpu.numel() + 1, dtype=torch.int32)
+    if seq_lens_cpu.numel():
+        cu_blocks[1:] = torch.cumsum(block_lens, dim=0)
     return cu_blocks
+
+
+def get_cu_block_seqlens(cu_seqlens: torch.Tensor | list[int] | tuple[int, ...], block_size: int) -> torch.Tensor:
+    """CPU-only compatibility wrapper. Prefer get_cu_block_seqlens_from_seq_lens."""
+    cu_cpu = _as_cpu_int32_1d(cu_seqlens, "cu_seqlens")
+    if cu_cpu.numel() == 0:
+        raise ValueError("cu_seqlens must contain at least one element")
+    seq_lens = cu_cpu[1:] - cu_cpu[:-1]
+    return get_cu_block_seqlens_from_seq_lens(seq_lens, block_size)
 
 
 def classify_blocks(
@@ -121,14 +162,18 @@ def count_mask_real_tokens(mask: torch.Tensor, seq_len: int, block_size: int) ->
     return total
 
 
-def compute_real_compact_plan(
-    cu_seqlens: torch.Tensor,
+def compute_real_compact_plan_from_seq_lens(
+    seq_lens: torch.Tensor | list[int] | tuple[int, ...],
     block_size: int,
     drop_ratio: float,
     attention_sink: int,
     last_q: int,
 ) -> RealCompactPlan:
-    """Compute exact real output lengths on CPU.
+    """Compute exact real output lengths from CPU request lengths.
+
+    This is the no-sync production contract: the planner consumes host-known
+    sequence metadata, not device cu_seqlens. Passing an accelerator tensor is
+    rejected instead of silently doing ``.cpu()`` and draining the queue.
 
     Policy:
     - sink blocks are always kept
@@ -141,8 +186,7 @@ def compute_real_compact_plan(
     if not (0.0 <= drop_ratio < 1.0):
         raise ValueError("drop_ratio must be in [0, 1)")
 
-    cu_cpu = cu_seqlens.detach().cpu().to(torch.int32)
-    seq_lens = cu_cpu[1:] - cu_cpu[:-1]
+    seq_lens = _as_cpu_int32_1d(seq_lens, "seq_lens")
     batch = int(seq_lens.numel())
 
     drop_middle = torch.zeros(batch, dtype=torch.int32)
@@ -187,6 +231,27 @@ def compute_real_compact_plan(
     )
 
 
+def compute_real_compact_plan_from_cu_seqlens(
+    cu_seqlens: torch.Tensor | list[int] | tuple[int, ...],
+    block_size: int,
+    drop_ratio: float,
+    attention_sink: int,
+    last_q: int,
+) -> RealCompactPlan:
+    """CPU-only compatibility wrapper around compute_real_compact_plan_from_seq_lens."""
+    cu_cpu = _as_cpu_int32_1d(cu_seqlens, "cu_seqlens")
+    if cu_cpu.numel() == 0:
+        raise ValueError("cu_seqlens must contain at least one element")
+    seq_lens = cu_cpu[1:] - cu_cpu[:-1]
+    return compute_real_compact_plan_from_seq_lens(
+        seq_lens, block_size, drop_ratio, attention_sink, last_q
+    )
+
+
+# Backward-compatible name, but still CPU-only.
+compute_real_compact_plan = compute_real_compact_plan_from_cu_seqlens
+
+
 def select_kept_blocks_for_request(
     scores: torch.Tensor,
     seq_len: int,
@@ -216,8 +281,8 @@ def topk_block_compact_reference(
     positions: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_scores: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_block_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor | list[int] | tuple[int, ...],
+    cu_block_seqlens: torch.Tensor | list[int] | tuple[int, ...],
     plan: RealCompactPlan,
     block_size: int,
     attention_sink: int,
@@ -231,6 +296,7 @@ def topk_block_compact_reference(
       positions:     [T]
       slot_mapping:  [T]
       block_scores:  [total_blocks]
+      seq_lens:      CPU [batch], host-known request lengths
 
     Outputs:
       hidden_out:       [real_cu_seqlens[-1], H]
@@ -251,9 +317,10 @@ def topk_block_compact_reference(
         raise ValueError("slot_mapping must be [T]")
 
     device = hidden_states.device
-    cu_seq = cu_seqlens.detach().cpu().to(torch.int32)
-    cu_blk = cu_block_seqlens.detach().cpu().to(torch.int32)
-    batch = int(cu_seq.numel() - 1)
+    seq_lens_cpu = _as_cpu_int32_1d(seq_lens, "seq_lens")
+    cu_seq = get_cu_seqlens_from_seq_lens(seq_lens_cpu)
+    cu_blk = _as_cpu_int32_1d(cu_block_seqlens, "cu_block_seqlens")
+    batch = int(seq_lens_cpu.numel())
     total_real = int(plan.real_cu_seqlens[-1].item())
     hidden_size = hidden_states.shape[1]
 
@@ -329,15 +396,14 @@ def demo() -> None:
     #   req0: 8192 tokens -> 128 blocks when block_size=64
     #   req1: 8192 tokens -> 128 blocks when block_size=64
     seq_lens = torch.tensor([8192, 8192], dtype=torch.int32)
-    cu_seqlens = torch.zeros(3, dtype=torch.int32)
-    cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0)
+    cu_seqlens = get_cu_seqlens_from_seq_lens(seq_lens)
     block_size = 64
     drop_ratio = 0.05
     attention_sink = 128
     last_q = 128
     hidden_size = 3
 
-    cu_block_seqlens = get_cu_block_seqlens(cu_seqlens, block_size)
+    cu_block_seqlens = get_cu_block_seqlens_from_seq_lens(seq_lens, block_size)
     total_tokens = int(cu_seqlens[-1].item())
     total_blocks = int(cu_block_seqlens[-1].item())
 
@@ -351,8 +417,8 @@ def demo() -> None:
     block_scores = torch.linspace(0.1, 1.0, steps=total_blocks, dtype=torch.float32)
     assert block_scores.numel() == total_blocks
 
-    plan = compute_real_compact_plan(
-        cu_seqlens, block_size, drop_ratio, attention_sink, last_q
+    plan = compute_real_compact_plan_from_seq_lens(
+        seq_lens, block_size, drop_ratio, attention_sink, last_q
     )
     result = topk_block_compact_reference(
         hidden_states,
@@ -360,7 +426,7 @@ def demo() -> None:
         positions,
         slot_mapping,
         block_scores,
-        cu_seqlens,
+        seq_lens,
         cu_block_seqlens,
         plan,
         block_size,
