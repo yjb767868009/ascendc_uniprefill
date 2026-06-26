@@ -238,4 +238,8 @@ python3 scripts/validate_fixed_topk_compact_out.py \
 
 The tiled operator adds host-known `kept_block_cu_seqlens` and preallocated
 `kept_block_indices`. These do not require D2H because their shapes and values
-come from CPU request metadata and the fixed 5% policy.
+come from CPU request metadata and the fixed 5% policy. The metadata phase is
+split into an indices kernel and a mask kernel because remote validation showed
+bisheng DSE can remove non-final GM stores. With the split, each metadata output
+is written as the final side effect of its own kernel before the tiled copy
+kernel consumes `kept_block_indices`.

@@ -97,8 +97,11 @@ results table.
 ## Tiled Compact Variant
 
 `uniprefill_fixed_topk_compact_tiled_out` is the performance-oriented variant.
-It first writes `kept_block_indices`, then launches a copy kernel over
-`kept_block x hidden_tile`. This gives the 8K hidden-state copy much more
+It launches separate select kernels for `kept_block_indices` and
+`kept_block_mask`, then launches a copy kernel over `kept_block x hidden_tile`.
+The select split is intentional: remote validation showed bisheng DSE can remove
+non-final GM stores, so each metadata output is written as the final side effect
+of its own kernel. The tiled copy gives the 8K hidden-state copy much more
 parallelism than the scalar correctness MVP, which used one core per request.
 
 Use `--variant tiled --hidden-tile 256` in the validation script to test it.

@@ -19,7 +19,12 @@ void uniprefill_fixed_topk_select_indices_kernel(
     uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
     uint8_t *blockScores, uint8_t *cuSeqlens, uint8_t *cuBlockSeqlens,
     uint8_t *keptBlockCuSeqlens, uint8_t *keepMiddleBlocks,
-    uint8_t *keptBlockMask, uint8_t *keptBlockIndices, uint8_t *tiling);
+    uint8_t *keptBlockIndices, uint8_t *tiling);
+
+void uniprefill_fixed_topk_write_mask_kernel(
+    uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
+    uint8_t *blockScores, uint8_t *cuSeqlens, uint8_t *cuBlockSeqlens,
+    uint8_t *keepMiddleBlocks, uint8_t *keptBlockMask, uint8_t *tiling);
 
 void uniprefill_fixed_topk_compact_copy_tiled_kernel(
     uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
@@ -255,7 +260,7 @@ void uniprefill_fixed_topk_compact_tiled_out_torch(
     copy_tiling.hiddenTileCount = hidden_tile_count;
     at::Tensor copy_tiling_tensor = copy_tiling_to_device(&copy_tiling, sizeof(copy_tiling), hidden_states.options());
 
-    if (batch == 0 || total_blocks == 0 || total_kept_blocks == 0) {
+    if (batch == 0 || total_blocks == 0) {
         return;
     }
 
@@ -265,9 +270,20 @@ void uniprefill_fixed_topk_compact_tiled_out_torch(
         reinterpret_cast<uint8_t*>(cu_block_seqlens.mutable_data_ptr()),
         reinterpret_cast<uint8_t*>(kept_block_cu_seqlens.mutable_data_ptr()),
         reinterpret_cast<uint8_t*>(keep_middle_blocks.mutable_data_ptr()),
-        reinterpret_cast<uint8_t*>(kept_block_mask.mutable_data_ptr()),
         reinterpret_cast<uint8_t*>(kept_block_indices.mutable_data_ptr()),
         reinterpret_cast<uint8_t*>(select_tiling_tensor.mutable_data_ptr()));
+
+    uniprefill_fixed_topk_write_mask_kernel(total_blocks, nullptr, acl_stream,
+        reinterpret_cast<uint8_t*>(block_scores.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(cu_seqlens.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(cu_block_seqlens.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(keep_middle_blocks.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(kept_block_mask.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(select_tiling_tensor.mutable_data_ptr()));
+
+    if (total_kept_blocks == 0) {
+        return;
+    }
 
     uint32_t copy_block_dim = total_kept_blocks * hidden_tile_count;
     uniprefill_fixed_topk_compact_copy_tiled_kernel(copy_block_dim, nullptr, acl_stream,
