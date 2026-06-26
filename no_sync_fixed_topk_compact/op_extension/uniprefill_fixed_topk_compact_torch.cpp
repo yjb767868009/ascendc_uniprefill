@@ -7,7 +7,7 @@
 #include "../op_kernel/no_sync_tiling.h"
 #include "ops.h"
 
-extern "C" void uniprefill_fixed_topk_compact_kernel(
+void uniprefill_fixed_topk_compact_kernel(
     uint32_t blockDim, void *l2Ctrl, aclrtStream stream,
     uint8_t *hiddenStates, uint8_t *residual, uint8_t *positions, uint8_t *slotMapping,
     uint8_t *blockScores, uint8_t *cuSeqlens, uint8_t *cuBlockSeqlens,

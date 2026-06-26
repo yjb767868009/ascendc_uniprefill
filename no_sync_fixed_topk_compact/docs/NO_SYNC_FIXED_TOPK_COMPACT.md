@@ -158,3 +158,15 @@ A value written to GM inside a kernel is not guaranteed to be immediately visibl
 to another `GetValue` in the same launch. The fixed top-k compact kernel must
 compute keep/drop decisions from source tensors and host metadata directly, then
 write `kept_block_mask` as an output.
+
+## Implementation Note: Bisheng Build And Optimization
+
+The AscendC kernel declaration and the C++ launcher declaration intentionally do
+not use `extern "C"`. In remote validation, bisheng still emitted a C++-mangled
+kernel symbol, so the C++ side must use the same C++ name mangling for symbol
+matching.
+
+The kernel also writes `kept_block_mask` after the compact copy loop. If mask
+stores are interleaved before data copy and the mask is not read again, bisheng
+can treat them as dead stores and remove them. The final mask loop keeps the
+stores as observable kernel output side effects.

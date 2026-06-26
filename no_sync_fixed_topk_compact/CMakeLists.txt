@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
+list(APPEND CMAKE_PREFIX_PATH "$ENV{ASCEND_HOME_PATH}/aarch64-linux/lib64/cmake")
 find_package(ASC REQUIRED)
 
 project(uniprefill_no_sync LANGUAGES ASC CXX)
@@ -37,6 +38,7 @@ target_include_directories(uniprefill_no_sync_ops PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/op_extension
     ${TORCH_INCLUDE_DIRS}
     ${TORCH_NPU_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS}
     ${ACL_INCLUDE_DIR}
 )
 
@@ -57,6 +59,11 @@ target_link_libraries(uniprefill_no_sync_ops PRIVATE
     graph_base
     ascendcl
     ascendc_runtime
+)
+
+target_link_options(uniprefill_no_sync_ops PRIVATE
+    -Wl,--whole-archive
+    -Wl,--no-whole-archive
 )
 
 target_compile_options(uniprefill_no_sync_ops PRIVATE
