@@ -150,3 +150,11 @@ kept_block_mask.shape = [256]
 - No `cu_seqlens[-1].item()` from an NPU tensor.
 - No output allocation based on a device-computed scalar.
 - No Python boolean indexing for compacting hidden states.
+
+## Implementation Note: GM Visibility
+
+Do not use GlobalTensor `SetValue`/`GetValue` as same-kernel scratch state.
+A value written to GM inside a kernel is not guaranteed to be immediately visible
+to another `GetValue` in the same launch. The fixed top-k compact kernel must
+compute keep/drop decisions from source tensors and host metadata directly, then
+write `kept_block_mask` as an output.
