@@ -17,6 +17,11 @@ The key point is that the output shape is still host-known before launch:
 So we avoid dynamic ``token_mask.sum()`` while also avoiding fake padding tokens
 entering FA / proposer / slot_mapping.
 
+Important reference-code boundary:
+Python control flow in this file is CPU-only. If a tensor is produced on an
+accelerator, the production AscendC kernel must branch on it inside the kernel;
+Python must not use ``.item()`` / ``.cpu()`` to inspect it.
+
 Answer to the latest question:
 the right policy is fixed 5% drop on middle blocks only. Sink/tail blocks are
 always kept, and the host precomputes the exact real output length from the
@@ -199,7 +204,7 @@ def compute_real_compact_plan_from_seq_lens(
     for req, seq_len_t in enumerate(seq_lens.tolist()):
         seq_len = int(seq_len_t)
         sink, middle, tail = classify_blocks(seq_len, block_size, attention_sink, last_q)
-        num_middle = int(middle.sum().item())
+        num_middle = middle.tolist().count(True)
         drop_k = int(num_middle * drop_ratio)  # floor by Python int conversion
         keep_k = num_middle - drop_k
 
@@ -218,7 +223,7 @@ def compute_real_compact_plan_from_seq_lens(
     if batch:
         real_cu[1:] = torch.cumsum(real_lens, dim=0)
 
-    max_real_len = int(real_lens.max().item()) if batch else 0
+    max_real_len = max(real_lens.tolist(), default=0)
     return RealCompactPlan(
         drop_middle_blocks_per_req=drop_middle,
         keep_middle_blocks_per_req=keep_middle,
@@ -252,7 +257,7 @@ def compute_real_compact_plan_from_cu_seqlens(
 compute_real_compact_plan = compute_real_compact_plan_from_cu_seqlens
 
 
-def select_kept_blocks_for_request(
+def select_kept_blocks_for_request_cpu(
     scores: torch.Tensor,
     seq_len: int,
     block_size: int,
@@ -260,19 +265,34 @@ def select_kept_blocks_for_request(
     attention_sink: int,
     last_q: int,
 ) -> torch.Tensor:
-    """Keep sink+tail blocks and top-k middle blocks by score."""
+    """CPU reference: keep sink+tail blocks and top-k middle blocks by score.
+
+    This helper intentionally rejects accelerator tensors. The real no-sync path
+    must do this selection inside the AscendC kernel, not by reading device
+    booleans in Python.
+    """
+    if scores.device.type != "cpu":
+        raise ValueError(
+            "scores must be CPU for the Python reference. Production AscendC "
+            "must select kept blocks on device without Python .item()/.cpu()."
+        )
+
     sink, middle, tail = classify_blocks(seq_len, block_size, attention_sink, last_q)
     kept = sink | tail
 
     middle_indices = torch.nonzero(middle, as_tuple=False).flatten()
     if middle_indices.numel() == 0 or keep_middle_blocks <= 0:
-        return kept.to(scores.device)
+        return kept
 
     keep_middle_blocks = min(int(keep_middle_blocks), int(middle_indices.numel()))
     middle_scores = scores[middle_indices].float()
     topk_local = torch.topk(middle_scores, k=keep_middle_blocks, largest=True, sorted=False).indices
     kept[middle_indices[topk_local]] = True
-    return kept.to(scores.device)
+    return kept
+
+
+# Backward-compatible name for old prototype users. Still CPU-only by design.
+select_kept_blocks_for_request = select_kept_blocks_for_request_cpu
 
 
 def topk_block_compact_reference(
@@ -305,7 +325,8 @@ def topk_block_compact_reference(
       slot_mapping_out: [real_cu_seqlens[-1]]
 
     The first dimension is host-known from ``plan``. No device-side token count
-    is needed to allocate it.
+    is needed to allocate it. ``block_scores`` is CPU-only in this Python
+    reference so the loop below never inspects an accelerator boolean.
     """
     if hidden_states.ndim != 2:
         raise ValueError("hidden_states must be [T, H]")
@@ -318,37 +339,39 @@ def topk_block_compact_reference(
 
     device = hidden_states.device
     seq_lens_cpu = _as_cpu_int32_1d(seq_lens, "seq_lens")
-    cu_seq = get_cu_seqlens_from_seq_lens(seq_lens_cpu)
-    cu_blk = _as_cpu_int32_1d(cu_block_seqlens, "cu_block_seqlens")
     batch = int(seq_lens_cpu.numel())
-    total_real = int(plan.real_cu_seqlens[-1].item())
+    cu_seq_list = get_cu_seqlens_from_seq_lens(seq_lens_cpu).tolist()
+    cu_blk_list = _as_cpu_int32_1d(cu_block_seqlens, "cu_block_seqlens").tolist()
+    real_cu_list = plan.real_cu_seqlens.tolist()
+    keep_middle_list = plan.keep_middle_blocks_per_req.tolist()
+    total_real = real_cu_list[-1]
     hidden_size = hidden_states.shape[1]
 
     hidden_out = torch.empty((total_real, hidden_size), dtype=hidden_states.dtype, device=device)
     residual_out = torch.empty((total_real, hidden_size), dtype=residual.dtype, device=device)
     positions_out = torch.empty((total_real,), dtype=positions.dtype, device=device)
     slot_mapping_out = torch.empty((total_real,), dtype=slot_mapping.dtype, device=device)
-    kept_block_mask = torch.zeros_like(block_scores, dtype=torch.bool, device=device)
+    kept_block_mask_cpu = torch.zeros(block_scores.numel(), dtype=torch.bool)
 
     for req in range(batch):
-        src_token_start = int(cu_seq[req].item())
-        src_token_end = int(cu_seq[req + 1].item())
+        src_token_start = cu_seq_list[req]
+        src_token_end = cu_seq_list[req + 1]
         seq_len = src_token_end - src_token_start
-        src_block_start = int(cu_blk[req].item())
-        src_block_end = int(cu_blk[req + 1].item())
-        dst_start = int(plan.real_cu_seqlens[req].item())
-        expected_end = int(plan.real_cu_seqlens[req + 1].item())
-        keep_middle = int(plan.keep_middle_blocks_per_req[req].item())
+        src_block_start = cu_blk_list[req]
+        src_block_end = cu_blk_list[req + 1]
+        dst_start = real_cu_list[req]
+        expected_end = real_cu_list[req + 1]
+        keep_middle = keep_middle_list[req]
 
         scores = block_scores[src_block_start:src_block_end]
-        kept = select_kept_blocks_for_request(
+        kept_cpu = select_kept_blocks_for_request_cpu(
             scores, seq_len, block_size, keep_middle, attention_sink, last_q
         )
-        kept_block_mask[src_block_start:src_block_end] = kept
+        kept_block_mask_cpu[src_block_start:src_block_end] = kept_cpu
 
         write = dst_start
-        for block_offset in range(int(kept.numel())):
-            if not bool(kept[block_offset].item()):
+        for block_offset, keep in enumerate(kept_cpu.tolist()):
+            if not keep:
                 continue
             src_begin = src_token_start + block_offset * block_size
             src_end = min(src_begin + block_size, src_token_end)
@@ -373,7 +396,7 @@ def topk_block_compact_reference(
         positions_out=positions_out,
         slot_mapping_out=slot_mapping_out,
         real_cu_seqlens=plan.real_cu_seqlens.to(device),
-        kept_block_mask=kept_block_mask,
+        kept_block_mask=kept_block_mask_cpu.to(device),
     )
 
 
@@ -437,7 +460,7 @@ def demo() -> None:
     assert plan.drop_middle_blocks_per_req.tolist() == [6, 6]
     assert plan.real_lens.tolist() == [7808, 7808]
     assert tuple(result.hidden_out.shape) == (15616, hidden_size)
-    assert int((~result.kept_block_mask).sum().item()) == 12
+    assert int((~result.kept_block_mask.cpu()).sum()) == 12
 
     print("Input shapes:")
     print(f"  hidden_states: {tuple(hidden_states.shape)}")
