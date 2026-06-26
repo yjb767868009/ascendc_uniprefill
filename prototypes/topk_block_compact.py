@@ -295,18 +295,112 @@ def select_kept_blocks_for_request_cpu(
 select_kept_blocks_for_request = select_kept_blocks_for_request_cpu
 
 
+def _as_cpu_float_tensor(values: torch.Tensor, name: str) -> torch.Tensor:
+    """Normalize CPU reference inputs without copying from an accelerator."""
+    if values.device.type != "cpu":
+        raise ValueError(
+            f"{name} must be CPU for this Python reference. Production AscendC "
+            "must compute block scores on device without Python .cpu()/.item()."
+        )
+    return values.float().contiguous()
+
+
+def compute_block_scores_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    seq_lens: torch.Tensor | list[int] | tuple[int, ...],
+    block_size: int,
+    last_q: int,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """CPU reference for the Triton q/k -> token score -> block score path.
+
+    This mirrors the local ``fused_top_p_selection_tp_pd.py`` score pipeline:
+    1. compute causal attention logits from each request's last-q queries to all
+       keys in the same request,
+    2. softmax over key tokens per query/head,
+    3. sum probabilities over the last-q queries to get token importance,
+    4. sum token importance across heads and tokens inside each block.
+
+    Shapes:
+      q: [T, num_q_heads, head_dim]
+      k: [T, num_k_heads, head_dim]
+      output: [total_blocks]
+    """
+    if q.ndim != 3 or k.ndim != 3:
+        raise ValueError("q and k must be [T, num_heads, head_dim]")
+    if q.shape[0] != k.shape[0]:
+        raise ValueError("q and k must have the same token dimension")
+    if q.shape[2] != k.shape[2]:
+        raise ValueError("q and k must have the same head_dim")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if last_q <= 0:
+        raise ValueError("last_q must be positive")
+
+    q_cpu = _as_cpu_float_tensor(q, "q")
+    k_cpu = _as_cpu_float_tensor(k, "k")
+    seq_lens_cpu = _as_cpu_int32_1d(seq_lens, "seq_lens")
+    cu_seq = get_cu_seqlens_from_seq_lens(seq_lens_cpu).tolist()
+    cu_blk = get_cu_block_seqlens_from_seq_lens(seq_lens_cpu, block_size).tolist()
+
+    num_q_heads = q_cpu.shape[1]
+    num_k_heads = k_cpu.shape[1]
+    head_dim = q_cpu.shape[2]
+    if num_q_heads % num_k_heads != 0:
+        raise ValueError("num_q_heads must be divisible by num_k_heads")
+
+    scale = softmax_scale if softmax_scale is not None else head_dim ** -0.5
+    block_scores = torch.zeros(cu_blk[-1], dtype=torch.float32)
+    group_size = num_q_heads // num_k_heads
+
+    for req, seq_len_t in enumerate(seq_lens_cpu.tolist()):
+        seq_len = int(seq_len_t)
+        if seq_len <= 0:
+            continue
+
+        token_start = cu_seq[req]
+        token_end = cu_seq[req + 1]
+        block_start = cu_blk[req]
+        q_len = min(last_q, seq_len)
+        q_local_start = seq_len - q_len
+        key_pos = torch.arange(seq_len)
+        token_scores = torch.zeros((seq_len, num_q_heads), dtype=torch.float32)
+
+        for q_head in range(num_q_heads):
+            k_head = q_head // group_size
+            q_tail = q_cpu[token_start + q_local_start : token_end, q_head, :]
+            k_req = k_cpu[token_start:token_end, k_head, :]
+            logits = torch.matmul(q_tail, k_req.transpose(0, 1)) * scale
+
+            q_pos = q_local_start + torch.arange(q_len)
+            causal = q_pos[:, None] >= key_pos[None, :]
+            logits = logits.masked_fill(~causal, float("-inf"))
+            probs = torch.softmax(logits, dim=-1)
+            token_scores[:, q_head] = probs.sum(dim=0)
+
+        for block_offset in range((seq_len + block_size - 1) // block_size):
+            lo = block_offset * block_size
+            hi = min(lo + block_size, seq_len)
+            block_scores[block_start + block_offset] = token_scores[lo:hi].sum()
+
+    return block_scores
+
+
 def topk_block_compact_reference(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     positions: torch.Tensor,
     slot_mapping: torch.Tensor,
-    block_scores: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
     seq_lens: torch.Tensor | list[int] | tuple[int, ...],
     cu_block_seqlens: torch.Tensor | list[int] | tuple[int, ...],
     plan: RealCompactPlan,
     block_size: int,
     attention_sink: int,
     last_q: int,
+    softmax_scale: float | None = None,
 ) -> RealCompactResult:
     """Compact kept blocks into a real dense output with no padding tokens.
 
@@ -315,7 +409,8 @@ def topk_block_compact_reference(
       residual:      [T, H]
       positions:     [T]
       slot_mapping:  [T]
-      block_scores:  [total_blocks]
+      q:             CPU [T, num_q_heads, head_dim]
+      k:             CPU [T, num_k_heads, head_dim]
       seq_lens:      CPU [batch], host-known request lengths
 
     Outputs:
@@ -325,8 +420,9 @@ def topk_block_compact_reference(
       slot_mapping_out: [real_cu_seqlens[-1]]
 
     The first dimension is host-known from ``plan``. No device-side token count
-    is needed to allocate it. ``block_scores`` is CPU-only in this Python
-    reference so the loop below never inspects an accelerator boolean.
+    is needed to allocate it. This Python reference computes ``block_scores``
+    from CPU q/k tensors; the production AscendC path should compute the same
+    scores on device and branch inside the kernel.
     """
     if hidden_states.ndim != 2:
         raise ValueError("hidden_states must be [T, H]")
@@ -351,6 +447,9 @@ def topk_block_compact_reference(
     residual_out = torch.empty((total_real, hidden_size), dtype=residual.dtype, device=device)
     positions_out = torch.empty((total_real,), dtype=positions.dtype, device=device)
     slot_mapping_out = torch.empty((total_real,), dtype=slot_mapping.dtype, device=device)
+    block_scores = compute_block_scores_reference(
+        q, k, seq_lens_cpu, block_size, last_q, softmax_scale
+    )
     kept_block_mask_cpu = torch.zeros(block_scores.numel(), dtype=torch.bool)
 
     for req in range(batch):
@@ -436,9 +535,11 @@ def demo() -> None:
     positions = torch.arange(total_tokens, dtype=torch.int64)
     slot_mapping = torch.arange(total_tokens, dtype=torch.int32) + 5000
 
-    # Higher score means more important middle block.
-    block_scores = torch.linspace(0.1, 1.0, steps=total_blocks, dtype=torch.float32)
-    assert block_scores.numel() == total_blocks
+    num_q_heads = 4
+    num_k_heads = 2
+    head_dim = 8
+    q = torch.randn(total_tokens, num_q_heads, head_dim, dtype=torch.float32)
+    k = torch.randn(total_tokens, num_k_heads, head_dim, dtype=torch.float32)
 
     plan = compute_real_compact_plan_from_seq_lens(
         seq_lens, block_size, drop_ratio, attention_sink, last_q
@@ -448,7 +549,8 @@ def demo() -> None:
         residual,
         positions,
         slot_mapping,
-        block_scores,
+        q,
+        k,
         seq_lens,
         cu_block_seqlens,
         plan,
@@ -467,7 +569,9 @@ def demo() -> None:
     print(f"  residual:      {tuple(residual.shape)}")
     print(f"  positions:     {tuple(positions.shape)}")
     print(f"  slot_mapping:  {tuple(slot_mapping.shape)}")
-    print(f"  block_scores:  {tuple(block_scores.shape)}")
+    print(f"  q:             {tuple(q.shape)}")
+    print(f"  k:             {tuple(k.shape)}")
+    print(f"  block_scores:  ({total_blocks},)  # computed inside topk_block_compact_reference")
     print("Host-known real compact plan:")
     print(f"  cu_seqlens:                 {cu_seqlens.tolist()}")
     print(f"  cu_block_seqlens:           {cu_block_seqlens.tolist()}")
