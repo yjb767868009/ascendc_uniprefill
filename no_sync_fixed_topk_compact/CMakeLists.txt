@@ -29,6 +29,7 @@ set(TORCH_NPU_LIBRARIES ${TORCH_NPU_PATH}/lib)
 
 add_library(uniprefill_no_sync_ops SHARED
     op_kernel/uniprefill_fixed_topk_compact_kernel.asc
+    op_kernel/uniprefill_fixed_topk_compact_tiled_kernel.asc
     op_extension/uniprefill_fixed_topk_compact_torch.cpp
     op_extension/register.cpp
 )

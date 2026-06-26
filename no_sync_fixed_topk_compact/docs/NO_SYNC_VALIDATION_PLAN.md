@@ -215,3 +215,27 @@ The kernel also writes `kept_block_mask` after the compact copy loop. If mask
 stores are interleaved before data copy and the mask is not read again, bisheng
 can treat them as dead stores and remove them. The final mask loop keeps the
 stores as observable kernel output side effects.
+
+## Tiled Performance Variant
+
+The scalar `_out` kernel is a correctness MVP and may be much slower than the
+Python mask baseline because it copies `[tokens, hidden]` with one core per
+request. The tiled variant should be used for performance validation:
+
+```bash
+python3 scripts/validate_fixed_topk_compact_out.py \
+  --mode correctness \
+  --variant tiled \
+  --hidden-tile 256
+
+python3 scripts/validate_fixed_topk_compact_out.py \
+  --mode benchmark \
+  --variant tiled \
+  --hidden-tile 256 \
+  --seq-lens 8192,8192 \
+  --hidden-size 4096
+```
+
+The tiled operator adds host-known `kept_block_cu_seqlens` and preallocated
+`kept_block_indices`. These do not require D2H because their shapes and values
+come from CPU request metadata and the fixed 5% policy.

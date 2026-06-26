@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - only available on Ascend machines.
 
 SO_NAME = "libuniprefill_no_sync_ops.so"
 OP_NAME = "uniprefill_fixed_topk_compact_out"
+TILED_OP_NAME = "uniprefill_fixed_topk_compact_tiled_out"
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class HostPlan:
     cu_seqlens: torch.Tensor
     cu_block_seqlens: torch.Tensor
     keep_middle_blocks: torch.Tensor
+    kept_block_cu_seqlens: torch.Tensor
     real_cu_seqlens: torch.Tensor
     total_tokens: int
     total_blocks: int
@@ -73,11 +75,14 @@ def make_host_plan(seq_lens_list: list[int], block_size: int, attention_sink: in
     cu_block_seqlens = torch.zeros_like(cu_seqlens)
     cu_block_seqlens[1:] = torch.cumsum(block_lens, dim=0)
     keep_middle = torch.zeros(len(seq_lens_list), dtype=torch.int32)
+    kept_block_lens = torch.zeros(len(seq_lens_list), dtype=torch.int32)
     real_lens = torch.zeros(len(seq_lens_list), dtype=torch.int32)
     for req, seq_len in enumerate(seq_lens_list):
         sink, middle, tail = classify_blocks(seq_len, block_size, attention_sink, last_q)
         keep = middle.count(True) - int(middle.count(True) * drop_ratio)
         keep_middle[req] = keep
+        forced_blocks = sum(1 for s, t in zip(sink, tail) if s or t)
+        kept_block_lens[req] = forced_blocks + keep
         real = 0
         for block_idx, is_sink in enumerate(sink):
             if is_sink:
@@ -87,9 +92,11 @@ def make_host_plan(seq_lens_list: list[int], block_size: int, attention_sink: in
                 real += block_real_len(block_idx, seq_len, block_size)
         real += keep * block_size
         real_lens[req] = real
+    kept_block_cu = torch.zeros_like(cu_seqlens)
+    kept_block_cu[1:] = torch.cumsum(kept_block_lens, dim=0)
     real_cu = torch.zeros_like(cu_seqlens)
     real_cu[1:] = torch.cumsum(real_lens, dim=0)
-    return HostPlan(seq_lens, cu_seqlens, cu_block_seqlens, keep_middle, real_cu,
+    return HostPlan(seq_lens, cu_seqlens, cu_block_seqlens, keep_middle, kept_block_cu, real_cu,
                     int(cu_seqlens[-1]), int(cu_block_seqlens[-1]), int(real_cu[-1]))
 
 
@@ -158,6 +165,7 @@ def load_op() -> None:
         raise FileNotFoundError(f"{so_path} not found. Build with cmake first.")
     torch.ops.load_library(so_path)
     getattr(torch.ops.npu, OP_NAME)
+    getattr(torch.ops.npu, TILED_OP_NAME)
 
 
 def run_out_op(tensors_npu, meta_npu, outputs_npu, block_size, attention_sink, last_q) -> None:
@@ -168,6 +176,53 @@ def run_out_op(tensors_npu, meta_npu, outputs_npu, block_size, attention_sink, l
         hidden, residual, positions, slot_mapping, scores, cu, cu_blk, real_cu, keep_middle,
         hidden_out, residual_out, positions_out, slot_mapping_out, kept_mask,
         block_size, attention_sink, last_q)
+
+
+def run_tiled_out_op(tensors_npu, meta_npu, outputs_npu, kept_block_indices, block_size, attention_sink, last_q, hidden_tile) -> None:
+    hidden, residual, positions, slot_mapping, scores = tensors_npu
+    cu, cu_blk, kept_block_cu, real_cu, keep_middle = meta_npu
+    hidden_out, residual_out, positions_out, slot_mapping_out, kept_mask = outputs_npu
+    torch.ops.npu.uniprefill_fixed_topk_compact_tiled_out(
+        hidden, residual, positions, slot_mapping, scores, cu, cu_blk, kept_block_cu, real_cu, keep_middle,
+        hidden_out, residual_out, positions_out, slot_mapping_out, kept_mask, kept_block_indices,
+        block_size, attention_sink, last_q, hidden_tile)
+
+
+def make_kept_block_indices_npu(plan: HostPlan):
+    return torch.empty((int(plan.kept_block_cu_seqlens[-1]),), device="npu", dtype=torch.int32)
+
+
+def prepare_variant_state(args, plan: HostPlan):
+    if args.variant == "scalar":
+        meta_npu = (
+            plan.cu_seqlens.npu(),
+            plan.cu_block_seqlens.npu(),
+            plan.real_cu_seqlens.npu(),
+            plan.keep_middle_blocks.npu(),
+        )
+        return meta_npu, None
+
+    meta_npu = (
+        plan.cu_seqlens.npu(),
+        plan.cu_block_seqlens.npu(),
+        plan.kept_block_cu_seqlens.npu(),
+        plan.real_cu_seqlens.npu(),
+        plan.keep_middle_blocks.npu(),
+    )
+    kept_block_indices = make_kept_block_indices_npu(plan)
+    return meta_npu, kept_block_indices
+
+
+def run_variant(args, tensors_npu, meta_npu, outputs_npu, kept_block_indices=None):
+    if args.variant == "scalar":
+        run_out_op(tensors_npu, meta_npu, outputs_npu, args.block_size, args.attention_sink, args.last_q)
+        return
+
+    if kept_block_indices is None:
+        raise ValueError("kept_block_indices is required for tiled variant")
+    run_tiled_out_op(
+        tensors_npu, meta_npu, outputs_npu, kept_block_indices,
+        args.block_size, args.attention_sink, args.last_q, args.hidden_tile)
 
 
 def make_outputs_npu(plan: HostPlan, hidden_size: int):
@@ -185,9 +240,9 @@ def correctness_case(args, name, seq_lens) -> bool:
     cpu_inputs = make_inputs(plan, args.hidden_size, args.seed)
     expected = cpu_golden(*cpu_inputs, plan, args.block_size, args.attention_sink, args.last_q)
     tensors_npu = tuple(x.npu() for x in cpu_inputs)
-    meta_npu = (plan.cu_seqlens.npu(), plan.cu_block_seqlens.npu(), plan.real_cu_seqlens.npu(), plan.keep_middle_blocks.npu())
     outputs_npu = make_outputs_npu(plan, args.hidden_size)
-    run_out_op(tensors_npu, meta_npu, outputs_npu, args.block_size, args.attention_sink, args.last_q)
+    meta_npu, kept_block_indices = prepare_variant_state(args, plan)
+    run_variant(args, tensors_npu, meta_npu, outputs_npu, kept_block_indices)
     sync_npu()
     actual = tuple(x.cpu() for x in outputs_npu)
     labels = ["hidden_out", "residual_out", "positions_out", "slot_mapping_out", "kept_block_mask"]
@@ -196,7 +251,7 @@ def correctness_case(args, name, seq_lens) -> bool:
         same = torch.equal(got, exp) if got.dtype in (torch.int32, torch.int64, torch.uint8) else torch.allclose(got, exp, atol=0, rtol=0)
         print(f"{name}.{label}: {'PASSED' if same else 'FAILED'}")
         ok = ok and same
-    print(f"{name}.metadata: total_tokens={plan.total_tokens} total_blocks={plan.total_blocks} total_real={plan.total_real_tokens} real_cu={plan.real_cu_seqlens.tolist()} keep_middle={plan.keep_middle_blocks.tolist()}")
+    print(f"{name}.metadata: total_tokens={plan.total_tokens} total_blocks={plan.total_blocks} total_kept_blocks={int(plan.kept_block_cu_seqlens[-1])} total_real={plan.total_real_tokens} real_cu={plan.real_cu_seqlens.tolist()} kept_block_cu={plan.kept_block_cu_seqlens.tolist()} keep_middle={plan.keep_middle_blocks.tolist()}")
     return ok
 
 
@@ -217,10 +272,9 @@ def make_expected_token_mask(plan: HostPlan, kept_mask_cpu: torch.Tensor, block_
     return mask
 
 
-def python_mask_baseline(tensors_npu, expected_mask_cpu):
+def python_mask_baseline(tensors_npu, expected_mask_npu):
     hidden, residual, positions, slot_mapping, _scores = tensors_npu
-    mask = expected_mask_cpu.bool().npu()
-    return hidden[mask], residual[mask], positions[mask], slot_mapping[mask]
+    return hidden[expected_mask_npu], residual[expected_mask_npu], positions[expected_mask_npu], slot_mapping[expected_mask_npu]
 
 
 def median_us(samples: list[float]) -> float:
@@ -234,24 +288,26 @@ def benchmark(args) -> None:
     expected = cpu_golden(*cpu_inputs, plan, args.block_size, args.attention_sink, args.last_q)
     expected_token_mask = make_expected_token_mask(plan, expected[-1], args.block_size)
     tensors_npu = tuple(x.npu() for x in cpu_inputs)
-    meta_npu = (plan.cu_seqlens.npu(), plan.cu_block_seqlens.npu(), plan.real_cu_seqlens.npu(), plan.keep_middle_blocks.npu())
+    expected_token_mask_npu = expected_token_mask.bool().npu()
     outputs_npu = make_outputs_npu(plan, args.hidden_size)
+    meta_npu, kept_block_indices = prepare_variant_state(args, plan)
+    sync_npu()
     for _ in range(args.warmup):
-        run_out_op(tensors_npu, meta_npu, outputs_npu, args.block_size, args.attention_sink, args.last_q)
+        run_variant(args, tensors_npu, meta_npu, outputs_npu, kept_block_indices)
     sync_npu()
     out_samples = []
     for _ in range(args.iters):
         t0 = time.perf_counter()
-        run_out_op(tensors_npu, meta_npu, outputs_npu, args.block_size, args.attention_sink, args.last_q)
+        run_variant(args, tensors_npu, meta_npu, outputs_npu, kept_block_indices)
         sync_npu()
         out_samples.append(time.perf_counter() - t0)
     for _ in range(args.warmup):
-        python_mask_baseline(tensors_npu, expected_token_mask)
+        python_mask_baseline(tensors_npu, expected_token_mask_npu)
     sync_npu()
     mask_samples = []
     for _ in range(args.iters):
         t0 = time.perf_counter()
-        python_mask_baseline(tensors_npu, expected_token_mask)
+        python_mask_baseline(tensors_npu, expected_token_mask_npu)
         sync_npu()
         mask_samples.append(time.perf_counter() - t0)
     out_us = median_us(out_samples)
@@ -262,6 +318,7 @@ def benchmark(args) -> None:
     print(f"  total_tokens: {plan.total_tokens}")
     print(f"  total_real_tokens: {plan.total_real_tokens}")
     print(f"  python_mask_baseline_median_us: {mask_us:.3f}")
+    print(f"  variant: {args.variant}")
     print(f"  fixed_topk_compact_out_median_us: {out_us:.3f}")
     print(f"  speedup_vs_python_mask: {(mask_us / out_us) if out_us > 0 else float('inf'):.3f}x")
 
@@ -271,12 +328,13 @@ def run_profile(args) -> None:
     seq_lens = parse_seq_lens(args.seq_lens)
     plan = make_host_plan(seq_lens, args.block_size, args.attention_sink, args.last_q, args.drop_ratio)
     tensors_npu = tuple(x.npu() for x in make_inputs(plan, args.hidden_size, args.seed))
-    meta_npu = (plan.cu_seqlens.npu(), plan.cu_block_seqlens.npu(), plan.real_cu_seqlens.npu(), plan.keep_middle_blocks.npu())
     outputs_npu = make_outputs_npu(plan, args.hidden_size)
+    meta_npu, kept_block_indices = prepare_variant_state(args, plan)
+    sync_npu()
     os.makedirs(args.profile_dir, exist_ok=True)
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.NPU], record_shapes=True) as prof:
         for _ in range(args.iters):
-            run_out_op(tensors_npu, meta_npu, outputs_npu, args.block_size, args.attention_sink, args.last_q)
+            run_variant(args, tensors_npu, meta_npu, outputs_npu, kept_block_indices)
         sync_npu()
     trace_path = os.path.join(args.profile_dir, "fixed_topk_compact_out_trace.json")
     prof.export_chrome_trace(trace_path)
@@ -288,6 +346,8 @@ def main() -> None:
     parser.add_argument("--mode", choices=["correctness", "benchmark"], default="correctness")
     parser.add_argument("--seq-lens", default="8192,8192")
     parser.add_argument("--hidden-size", type=int, default=512)
+    parser.add_argument("--variant", choices=["scalar", "tiled"], default="tiled")
+    parser.add_argument("--hidden-tile", type=int, default=256)
     parser.add_argument("--block-size", type=int, default=64)
     parser.add_argument("--attention-sink", type=int, default=128)
     parser.add_argument("--last-q", type=int, default=128)

@@ -13,5 +13,5 @@ source "${ASCEND_HOME_PATH}/set_env.sh"
 
 cmake -S . -B build
 cmake --build build -j4
-python3 scripts/validate_fixed_topk_compact_out.py --mode correctness
-python3 scripts/validate_fixed_topk_compact_out.py --mode benchmark --seq-lens 8192,8192 --hidden-size 4096 --iters 100 --warmup 20
+python3 scripts/validate_fixed_topk_compact_out.py --mode correctness --variant tiled --hidden-tile 256
+python3 scripts/validate_fixed_topk_compact_out.py --mode benchmark --variant tiled --hidden-tile 256 --seq-lens 8192,8192 --hidden-size 4096 --iters 100 --warmup 20

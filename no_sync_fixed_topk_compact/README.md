@@ -77,6 +77,8 @@ python3 scripts/validate_fixed_topk_compact_out.py --mode correctness
 ```bash
 python3 scripts/validate_fixed_topk_compact_out.py \
   --mode benchmark \
+  --variant tiled \
+  --hidden-tile 256 \
   --seq-lens 8192,8192 \
   --hidden-size 4096 \
   --iters 100 \
@@ -91,3 +93,12 @@ bash run_validation.sh
 
 See `docs/NO_SYNC_VALIDATION_PLAN.md` for the full acceptance criteria and
 results table.
+
+## Tiled Compact Variant
+
+`uniprefill_fixed_topk_compact_tiled_out` is the performance-oriented variant.
+It first writes `kept_block_indices`, then launches a copy kernel over
+`kept_block x hidden_tile`. This gives the 8K hidden-state copy much more
+parallelism than the scalar correctness MVP, which used one core per request.
+
+Use `--variant tiled --hidden-tile 256` in the validation script to test it.
