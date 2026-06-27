@@ -99,11 +99,13 @@ fill out `docs/TILED_FIX_TEST_REPORT.md` on an Ascend NPU machine.
 ## Tiled Compact Variant
 
 `uniprefill_fixed_topk_compact_tiled_out` is the performance-oriented variant.
-It launches separate select kernels for `kept_block_indices` and
-`kept_block_mask`, then launches a copy kernel over `kept_block x hidden_tile`.
-The select split is intentional: remote validation showed bisheng DSE can remove
-non-final GM stores, so each metadata output is written as the final side effect
-of its own kernel. The tiled copy gives the 8K hidden-state copy much more
-parallelism than the scalar correctness MVP, which used one core per request.
+It first writes `kept_block_mask`, then launches the copy kernel over
+`total_block x hidden_tile`. The copy kernel treats the mask as the source of
+truth, rebuilds `kept_block_indices` from kept mask positions, and copies each
+kept block using accumulated real token lengths. This avoids consuming
+uninitialized `kept_block_indices` slots if bisheng removes metadata-only stores,
+and it handles final blocks whose real token count is smaller than `block_size`.
+The tiled copy gives the 8K hidden-state copy much more parallelism than the
+scalar correctness MVP, which used one core per request.
 
 Use `--variant tiled --hidden-tile 256` in the validation script to test it.

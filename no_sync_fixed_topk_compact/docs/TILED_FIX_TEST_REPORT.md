@@ -98,6 +98,8 @@ Result:
 Checklist:
 
 - [ ] `kept_block_indices` passed
+- [ ] `kept_block_indices` contains no `-1` sentinel values
+- [ ] `kept_block_mask` passed
 - [ ] `hidden_out` passed
 - [ ] `residual_out` passed
 - [ ] `positions_out` passed
@@ -232,6 +234,7 @@ Evidence:
 
 ```text
 `kept_block_indices` validation result:
+Any `-1` sentinel values after tiled run:
 Vector core exception observed:
 ```
 
