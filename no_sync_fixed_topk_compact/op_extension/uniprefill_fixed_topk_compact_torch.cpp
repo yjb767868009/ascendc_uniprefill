@@ -264,14 +264,16 @@ void uniprefill_fixed_topk_compact_tiled_out_torch(
         return;
     }
 
-    uniprefill_fixed_topk_select_indices_kernel(total_blocks, nullptr, acl_stream,
-        reinterpret_cast<uint8_t*>(block_scores.mutable_data_ptr()),
-        reinterpret_cast<uint8_t*>(cu_seqlens.mutable_data_ptr()),
-        reinterpret_cast<uint8_t*>(cu_block_seqlens.mutable_data_ptr()),
-        reinterpret_cast<uint8_t*>(kept_block_cu_seqlens.mutable_data_ptr()),
-        reinterpret_cast<uint8_t*>(keep_middle_blocks.mutable_data_ptr()),
-        reinterpret_cast<uint8_t*>(kept_block_indices.mutable_data_ptr()),
-        reinterpret_cast<uint8_t*>(select_tiling_tensor.mutable_data_ptr()));
+    if (total_kept_blocks > 0) {
+        uniprefill_fixed_topk_select_indices_kernel(total_kept_blocks, nullptr, acl_stream,
+            reinterpret_cast<uint8_t*>(block_scores.mutable_data_ptr()),
+            reinterpret_cast<uint8_t*>(cu_seqlens.mutable_data_ptr()),
+            reinterpret_cast<uint8_t*>(cu_block_seqlens.mutable_data_ptr()),
+            reinterpret_cast<uint8_t*>(kept_block_cu_seqlens.mutable_data_ptr()),
+            reinterpret_cast<uint8_t*>(keep_middle_blocks.mutable_data_ptr()),
+            reinterpret_cast<uint8_t*>(kept_block_indices.mutable_data_ptr()),
+            reinterpret_cast<uint8_t*>(select_tiling_tensor.mutable_data_ptr()));
+    }
 
     uniprefill_fixed_topk_write_mask_kernel(total_blocks, nullptr, acl_stream,
         reinterpret_cast<uint8_t*>(block_scores.mutable_data_ptr()),
@@ -285,6 +287,9 @@ void uniprefill_fixed_topk_compact_tiled_out_torch(
         return;
     }
 
+    TORCH_CHECK(hidden_tile_count > 0, "hidden_tile_count must be positive");
+    TORCH_CHECK(total_kept_blocks <= static_cast<uint32_t>(UINT32_MAX / hidden_tile_count),
+                "copy blockDim overflow");
     uint32_t copy_block_dim = total_kept_blocks * hidden_tile_count;
     uniprefill_fixed_topk_compact_copy_tiled_kernel(copy_block_dim, nullptr, acl_stream,
         reinterpret_cast<uint8_t*>(hidden_states.mutable_data_ptr()),

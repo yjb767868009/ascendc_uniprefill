@@ -189,7 +189,19 @@ def run_tiled_out_op(tensors_npu, meta_npu, outputs_npu, kept_block_indices, blo
 
 
 def make_kept_block_indices_npu(plan: HostPlan):
-    return torch.empty((int(plan.kept_block_cu_seqlens[-1]),), device="npu", dtype=torch.int32)
+    return torch.full((int(plan.kept_block_cu_seqlens[-1]),), -1, device="npu", dtype=torch.int32)
+
+
+def expected_kept_block_indices(plan: HostPlan, kept_mask: torch.Tensor) -> torch.Tensor:
+    indices: list[int] = []
+    cu_blk = plan.cu_block_seqlens.tolist()
+    for req in range(len(plan.seq_lens)):
+        block_start = cu_blk[req]
+        block_end = cu_blk[req + 1]
+        for local in range(block_end - block_start):
+            if kept_mask[block_start + local].item() != 0:
+                indices.append(local)
+    return torch.tensor(indices, dtype=torch.int32)
 
 
 def prepare_variant_state(args, plan: HostPlan):
@@ -250,6 +262,16 @@ def correctness_case(args, name, seq_lens) -> bool:
     for label, got, exp in zip(labels, actual, expected):
         same = torch.equal(got, exp) if got.dtype in (torch.int32, torch.int64, torch.uint8) else torch.allclose(got, exp, atol=0, rtol=0)
         print(f"{name}.{label}: {'PASSED' if same else 'FAILED'}")
+        ok = ok and same
+    if args.variant == "tiled":
+        assert kept_block_indices is not None
+        got_indices = kept_block_indices.cpu()
+        exp_indices = expected_kept_block_indices(plan, expected[-1])
+        same = torch.equal(got_indices, exp_indices)
+        print(f"{name}.kept_block_indices: {'PASSED' if same else 'FAILED'}")
+        if not same:
+            print(f"  actual={got_indices}")
+            print(f"  expect={exp_indices}")
         ok = ok and same
     print(f"{name}.metadata: total_tokens={plan.total_tokens} total_blocks={plan.total_blocks} total_kept_blocks={int(plan.kept_block_cu_seqlens[-1])} total_real={plan.total_real_tokens} real_cu={plan.real_cu_seqlens.tolist()} kept_block_cu={plan.kept_block_cu_seqlens.tolist()} keep_middle={plan.keep_middle_blocks.tolist()}")
     return ok

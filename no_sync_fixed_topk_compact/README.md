@@ -35,7 +35,8 @@ no_sync_fixed_topk_compact/
 ├── run_validation.sh
 ├── docs/
 │   ├── NO_SYNC_FIXED_TOPK_COMPACT.md
-│   └── NO_SYNC_VALIDATION_PLAN.md
+│   ├── NO_SYNC_VALIDATION_PLAN.md
+│   └── TILED_FIX_TEST_REPORT.md
 ├── op_kernel/
 │   ├── no_sync_tiling.h
 │   └── uniprefill_fixed_topk_compact_kernel.asc
@@ -92,7 +93,8 @@ bash run_validation.sh
 ```
 
 See `docs/NO_SYNC_VALIDATION_PLAN.md` for the full acceptance criteria and
-results table.
+results table. For the tiled indices and non-multiple-block regression fix,
+fill out `docs/TILED_FIX_TEST_REPORT.md` on an Ascend NPU machine.
 
 ## Tiled Compact Variant
 
