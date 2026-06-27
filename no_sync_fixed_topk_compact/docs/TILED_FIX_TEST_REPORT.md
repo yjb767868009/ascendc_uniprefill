@@ -235,6 +235,7 @@ Evidence:
 ```text
 `kept_block_indices` validation result:
 Any `-1` sentinel values after tiled run:
+RebuildIndices kernel evidence/log summary:
 Vector core exception observed:
 ```
 
